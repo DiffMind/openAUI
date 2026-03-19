@@ -1,6 +1,6 @@
 import sys, os
-import threading, time, logging
-from typing import List
+import threading, logging
+from typing import List, Callable
 
 sys.path.append(os.path.abspath(".."))
 from haystack import Pipeline
@@ -8,13 +8,13 @@ from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack_integrations.tools.mcp import StreamableHttpServerInfo, MCPToolset
 from haystack.components.tools import ToolInvoker
 from haystack.components.converters import OutputAdapter
-from haystack.dataclasses import ChatMessage
-from pathlib import Path
-import json
+from haystack.dataclasses import ChatMessage, StreamingChunk
 import threading
 from mcp.server.fastmcp import FastMCP
-from tools import disks
+from tools import disks, folder
 from router import router
+
+LLMStreamingCallback = Callable[[str], None]
 
 
 class chatter(object):
@@ -52,6 +52,7 @@ class chatter(object):
     def startMcpServer(self, envent: threading.Event, host, port):
         mcp = FastMCP(__name__, host=host, port=port)
         disks.register_tools(mcp)
+        folder.register_tools(mcp)
         print(f"MCP Serving on http://{host}:{port}/mcp")
         envent.set()
         mcp.run(transport="streamable-http")
@@ -62,7 +63,12 @@ class chatter(object):
         # ########################
         # Components #
         chatPL = Pipeline()
-
+        generation_kwargs = {
+            "extra_body": {
+                "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        }
         server_info = StreamableHttpServerInfo(
             url=f"http://{self.mcp_host}:{self.mcp_port}/mcp"
         )
@@ -72,9 +78,7 @@ class chatter(object):
             model=self.llm_model,
             tools=toolset,
             tools_strict=True,
-            generation_kwargs={
-                "temperature": 0.1,
-            },
+            generation_kwargs=generation_kwargs,
         )
         chatPL.add_component("llm_tool", llm_tool)
         chatPL.add_component("llm_router", router())
@@ -90,6 +94,7 @@ class chatter(object):
         llm_response = OpenAIChatGenerator(
             api_base_url=self.llm_url,
             model=self.llm_model,
+            generation_kwargs=generation_kwargs,
         )
         chatPL.add_component("llm_response", llm_response)
 
@@ -105,9 +110,16 @@ class chatter(object):
             chatPL.draw("pipeline.png")
         return chatPL
 
-    def aiChat(self, messages: List[ChatMessage]):
+    def aiChat(
+        self, messages: List[ChatMessage], call_back: LLMStreamingCallback = None
+    ):
+        def on_token(stream: StreamingChunk):
+            if call_back:
+                call_back(stream.content)
+
         data = {
             "llm_tool": {"messages": messages},
+            "llm_response": {"streaming_callback": on_token},
             "tool_adapter": {"initial_msg": messages},
         }
         result = self.chatPL.run(data=data, include_outputs_from=["llm_router"])
